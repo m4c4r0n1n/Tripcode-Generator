@@ -2,7 +2,7 @@
 
 Tripcode generator and tester. Type what you want in your trip, hit Start, and it finds passwords that give you that trip. It runs right in your browser and nothing gets sent anywhere.
 
-Works on drrr.com and 4chan. On 4chan it's for regular trips (name#password). Secure trips (name##password) won't match.
+It generates classic DES-based tripcodes (name#password). Secure trips (name##password) won't match.
 
 Use it here: https://m4c4r0n1n.github.io/Tripcode-Generator/
 
