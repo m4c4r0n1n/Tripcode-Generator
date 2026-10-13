@@ -1,6 +1,6 @@
 # Tripcode Generator
 
-Tripcode generator and tester. Type what you want in your trip, hit Start, and it finds passwords that give you that trip. It runs right in your browser and nothing gets sent anywhere.
+Tripcode generator and tester. Type the word you want in your trip, hit Start, and it finds passwords that give you that trip. It runs right in your browser and nothing gets sent anywhere.
 
 It generates classic DES-based tripcodes (name#password). Secure trips (name##password) won't match.
 
