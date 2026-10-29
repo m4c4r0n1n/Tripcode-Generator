@@ -41,6 +41,7 @@ td.pw:hover{text-decoration:underline}
 .empty{color:var(--muted);font:14px system-ui,sans-serif;padding:8px}
 .bad{color:var(--warn)}
 .note{font-size:13px;color:var(--muted);margin:10px 0 0}
+.compute-row{margin-bottom:12px;max-width:260px}
 </style>
 </head>
 <body>
@@ -50,7 +51,7 @@ td.pw:hover{text-decoration:underline}
 <section>
 <h2>Find a tripcode</h2>
 <div class="row">
-  <div><label for="target">Text to find (separate several with commas)</label><input id="target" type="text" placeholder="e.g. Cool, Neko, 777" autocomplete="off" spellcheck="false"></div>
+  <div><label for="target">Text to find (separate several with commas)</label><input id="target" type="text" autocomplete="off" spellcheck="false"></div>
   <div><label for="mode">Where</label><select id="mode"><option value="any">Anywhere</option><option value="start">At the start</option><option value="end">At the end</option></select></div>
   <div><label for="charset">Password characters</label><select id="charset"><option value="an">Letters + numbers</option><option value="lower">lowercase + numbers</option><option value="sym">Letters, numbers, symbols</option></select></div>
 </div>
@@ -58,18 +59,29 @@ td.pw:hover{text-decoration:underline}
   <span><input type="checkbox" id="icase"> <label for="icase">Ignore upper/lower case</label></span>
   <span><input type="checkbox" id="stopfirst"> <label for="stopfirst">Stop at first hit</label></span>
 </div>
+<div class="compute-row">
+  <label for="computeMode">Compute on</label>
+  <select id="computeMode"><option value="gpu">GPU only</option><option value="cpu">CPU only</option><option value="both">GPU + CPU</option></select>
+</div>
 <div class="slider">
-  <label for="workers">Workers</label>
+  <label for="gpuworkers">GPU workgroups</label>
+  <input id="gpuworkers" type="range" min="256" max="65535" step="256" value="16384">
+  <b id="gpuworkersval">16384</b>
+  <span>per batch × 64 GPU lanes; tune for your device</span>
+</div>
+<div class="slider">
+  <label for="workers">CPU workers</label>
   <input id="workers" type="range" min="1" max="4" value="3">
   <b id="workersval">3</b>
   <span>of <span id="workersmax">4</span> on this computer · can be changed while running</span>
 </div>
+<div class="note" id="computeStatus">GPU only stops if WebGPU is unavailable; GPU + CPU can fall back to CPU workers.</div>
 <button id="go">Start</button> <button id="stop" class="ghost" disabled>Stop</button>
 <div class="stats">
   <span>Tried <b id="tried">0</b></span>
   <span>Speed <b id="speed">0</b>/sec</span>
   <span>Found <b id="found">0</b></span>
-  <span>Avg time per hit <b id="eta">-</b></span>
+  <span>Est. time to hit <b id="eta">-</b></span>
   <span>Running <b id="threads">0</b></span>
 </div>
 <div class="msg" id="msg"></div>
@@ -277,10 +289,25 @@ function runSearch(m,post){
     tr.appendChild(a);tr.appendChild(b);tr.appendChild(m);
     $('results').insertBefore(tr,$('results').firstChild);
   }
+  function updateThreadCount(){
+    var active=[];
+    if(running&&running.gpuActive)active.push('GPU');
+    if(workers.length)active.push((workers.inline?1:workers.length)+' CPU');
+    $('threads').textContent=active.join(' + ')||'0';
+  }
+  function updateComputeControls(){
+    var mode=$('computeMode').value;
+    $('gpuworkers').disabled=mode==='cpu';
+    $('workers').disabled=(mode==='gpu'&&!(running&&running.cpuEnabled))||!!(workers.inline&&timer);
+    $('computeMode').disabled=!!timer;
+  }
   function stop(){
+    if(running&&running.stopGpu)running.stopGpu();
     workers.forEach(function(w){w.terminate();});workers=[];running=null;
     clearInterval(timer);timer=null;
-    $('go').disabled=false;$('stop').disabled=true;$('threads').textContent='0';
+    $('go').disabled=false;$('stop').disabled=true;
+    $('computeStatus').textContent='Stopped.';
+    updateThreadCount();updateComputeControls();
   }
   function update(){
     samples.push([Date.now(),tried]);
@@ -288,6 +315,7 @@ function runSearch(m,post){
     $('tried').textContent=fmt(tried);$('speed').textContent=fmt(currentRate());$('found').textContent=fmt(found);$('eta').textContent=avgWait();
   }
   $('stop').onclick=function(){update();stop();};
+  $('computeMode').addEventListener('change',updateComputeControls);
   $('go').onclick=function(){
     var mode=$('mode').value,icase=$('icase').checked;
     var labels=$('target').value.split(',').map(function(s){return s.trim();}).filter(Boolean);
@@ -308,22 +336,82 @@ function runSearch(m,post){
     tried=0;found=0;seen={};$('results').innerHTML='';$('empty').style.display='';
     var job={targets:cur.targets,mode:mode,icase:icase,charset:CHARSETS[$('charset').value]};
     var stopFirst=$('stopfirst').checked;
+    job.stopFirst=stopFirst;
+    var computeMode=$('computeMode').value;
     function onBatch(d){
       if(!timer)return;
       tried+=d.tried;
-      d.hits.forEach(function(h){addHit(h[0],h[1],h[2]);});
+      if(stopFirst){
+        if(d.hits.length)addHit(d.hits[0][0],d.hits[0][1],d.hits[0][2]);
+      }else d.hits.forEach(function(h){addHit(h[0],h[1],h[2]);});
       if(stopFirst&&found>0){update();stop();}
     }
     $('go').disabled=true;$('stop').disabled=false;
     samples=[[Date.now(),0]];
     timer=setInterval(update,250);
-    running={job:job,onBatch:onBatch};
-    setWorkerCount(+$('workers').value);
+    running={job:job,onBatch:onBatch,mode:computeMode,gpuActive:false,cpuEnabled:computeMode!=='gpu'};
+    updateComputeControls();
+    if(computeMode==='cpu'){
+      $('computeStatus').textContent='Searching with CPU workers.';
+      setWorkerCount(+$('workers').value);
+      return;
+    }
+    if(computeMode==='both'){
+      $('computeStatus').textContent='Starting GPU; searching with CPU workers.';
+      setWorkerCount(+$('workers').value);
+    }else $('computeStatus').textContent='Checking for WebGPU support...';
+    createGpuSearch(job).then(function(gpu){
+      if(!timer){if(gpu)destroyGpu(gpu);return;}
+      if(gpu){
+        running.gpuActive=true;
+        var gpuName=gpu.adapterName?' ('+gpu.adapterName+')':'';
+        $('computeStatus').textContent=computeMode==='both'
+          ?'Searching with high-performance GPU'+gpuName+' and '+workers.length+' CPU workers.'
+          :'Searching with high-performance GPU'+gpuName+' ('+$('gpuworkers').value+' workgroups per dispatch).';
+        updateThreadCount();
+        runGpuSearch(gpu,job,onBatch).catch(function(err){
+          if(!timer)return;
+          $('msg').textContent='GPU error: '+(err&&err.message?err.message:String(err));
+          running.gpuActive=false;
+          running.stopGpu=null;
+          if(computeMode==='both'){
+            $('computeStatus').textContent='GPU failed; continuing with CPU workers.';
+            updateThreadCount();
+            if(!workers.length){running.mode='cpu';fallback();}
+          }else{
+            stop();
+            $('computeStatus').textContent='GPU-only search stopped because WebGPU failed. No CPU workers were started.';
+          }
+        });
+      }else{
+        if(computeMode==='both'){
+          $('computeStatus').textContent='WebGPU unavailable; continuing with CPU workers.';
+          running.cpuEnabled=true;
+          updateComputeControls();
+          if(!workers.length){running.mode='cpu';fallback();}
+        }else{
+          stop();
+          $('computeStatus').textContent='WebGPU unavailable; GPU-only search stopped. No CPU workers were started.';
+        }
+      }
+    }).catch(function(err){
+      if(!timer)return;
+      $('msg').textContent='Could not initialize WebGPU: '+(err&&err.message?err.message:String(err));
+      if(computeMode==='both'){
+        $('computeStatus').textContent='Could not initialize WebGPU; continuing with CPU workers.';
+        running.cpuEnabled=true;
+        updateComputeControls();
+        if(!workers.length){running.mode='cpu';fallback();}
+      }else{
+        stop();
+        $('computeStatus').textContent='Could not initialize WebGPU; GPU-only search stopped. No CPU workers were started.';
+      }
+    });
   };
 
   // Add or remove workers until the number of workers is n.
   function setWorkerCount(n){
-    if(!timer||!running||workers.inline)return;
+    if(!timer||!running||!running.cpuEnabled||workers.inline)return;
     try{
       while(workers.length<n){
         var w=new Worker(workerUrl());
@@ -334,7 +422,8 @@ function runSearch(m,post){
       }
     }catch(err){fallback();return;}
     while(workers.length>n)workers.pop().terminate();
-    $('threads').textContent=workers.length;
+    updateThreadCount();
+    if(running.gpuActive&&running.mode==='both')$('computeStatus').textContent='Searching with GPU and '+workers.length+' CPU workers.';
   }
   function workerUrl(){
     if(!blobUrl)blobUrl=URL.createObjectURL(new Blob([engineSrc+'\n'+workerSrc+'\nonmessage=function(e){runSearch(e.data,function(d){postMessage(d);});};'],{type:'text/javascript'}));
@@ -344,10 +433,234 @@ function runSearch(m,post){
   function fallback(){
     if(!timer||workers.inline)return;
     workers.forEach(function(w){w.terminate();});
+    if(running.gpuActive||(running.mode==='both'&&workers.length)){
+      workers=[];
+      $('msg').textContent='Could not start CPU workers; GPU search will continue.';
+      updateThreadCount();
+      return;
+    }
     var halt=runSearch(running.job,running.onBatch);
     workers=[{terminate:halt}];workers.inline=true;
-    $('threads').textContent='1';
+    updateThreadCount();
+    updateComputeControls();
     $('msg').textContent='This browser blocked background workers, so the search is running on 1 worker.';
+  }
+
+  var gpuShader=`
+struct Params { count:u32, n:u32, b0:u32, b1:u32, b2:u32, b3:u32, b4:u32, b5:u32, b6:u32, b7:u32, mode:u32, targetCount:u32, icase:u32, conLength:u32, pad:u32 };
+@group(0) @binding(0) var<storage,read> sp:array<u32>;
+@group(0) @binding(1) var<storage,read> skb:array<u32>;
+@group(0) @binding(2) var<storage,read> conSalt:array<u32>;
+@group(0) @binding(3) var<storage,read> shifts:array<u32>;
+@group(0) @binding(4) var<storage,read> cov:array<u32>;
+@group(0) @binding(5) var<storage,read> codes:array<u32>;
+@group(0) @binding(6) var<storage,read> targets:array<u32>;
+@group(0) @binding(7) var<uniform> params:Params;
+@group(0) @binding(8) var<storage,read_write> output:array<atomic<u32>>;
+
+fn trip(key:array<u32,8>)->array<u32,10>{
+  var ks:array<u32,32>;
+  let e0=conSalt[conSalt[params.conLength+key[1]]];
+  let e1=conSalt[conSalt[params.conLength+key[2]]]<<4u;
+  var c=(key[0]<<1u)|(key[1]<<9u)|(key[2]<<17u)|(key[3]<<25u);
+  var d=(key[4]<<1u)|(key[5]<<9u)|(key[6]<<17u)|(key[7]<<25u);
+  var t=((d>>4u)^c)&0x0f0f0f0fu;c^=t;d^=t<<4u;
+  t=((c<<18u)^c)&0xcccc0000u;c=c^t^(t>>18u);
+  t=((d<<18u)^d)&0xcccc0000u;d=d^t^(t>>18u);
+  t=((d>>1u)^c)&0x55555555u;c^=t;d^=t<<1u;
+  t=((c>>8u)^d)&0x00ff00ffu;d^=t;c^=t<<8u;
+  t=((d>>1u)^c)&0x55555555u;c^=t;d^=t<<1u;
+  d=((d&0xffu)<<16u)|(d&0xff00u)|((d&0xff0000u)>>16u)|((c&0xf0000000u)>>4u);
+  c&=0x0fffffffu;
+  var j=0u;
+  for(var i=0u;i<16u;i++){
+    if(shifts[i]!=0u){c=(c>>2u)|(c<<26u);d=(d>>2u)|(d<<26u);}
+    else{c=(c>>1u)|(c<<27u);d=(d>>1u)|(d<<27u);}
+    c&=0x0fffffffu;d&=0x0fffffffu;
+    var s=skb[c&0x3fu]|skb[64u+(((c>>6u)&0x03u)|((c>>7u)&0x3cu))]|skb[128u+(((c>>13u)&0x0fu)|((c>>14u)&0x30u))]|skb[192u+(((c>>20u)&0x01u)|((c>>21u)&0x06u)|((c>>22u)&0x38u))];
+    var u=skb[256u+(d&0x3fu)]|skb[320u+(((d>>7u)&0x03u)|((d>>8u)&0x3cu))]|skb[384u+((d>>15u)&0x3fu)]|skb[448u+(((d>>21u)&0x0fu)|((d>>22u)&0x30u))];
+    ks[j]=(u<<16u)|(s&0xffffu);j++;
+    s=(s>>16u)|(u&0xffff0000u);
+    ks[j]=(s<<4u)|(s>>28u);j++;
+  }
+  var l=0u;var r=0u;
+  for(var n=0u;n<25u;n++){
+    for(var i=0u;i<32u;i+=4u){
+      var v=r^(r>>16u);var x=v&e0;v&=e1;x=(x^(x<<16u))^r^ks[i];var y=(v^(v<<16u))^r^ks[i+1u];y=(y>>4u)|(y<<28u);
+      l^=sp[64u+(y&0x3fu)]|sp[192u+((y>>8u)&0x3fu)]|sp[320u+((y>>16u)&0x3fu)]|sp[448u+((y>>24u)&0x3fu)]|sp[x&0x3fu]|sp[128u+((x>>8u)&0x3fu)]|sp[256u+((x>>16u)&0x3fu)]|sp[384u+((x>>24u)&0x3fu)];
+      v=l^(l>>16u);x=v&e0;v&=e1;x=(x^(x<<16u))^l^ks[i+2u];y=(v^(v<<16u))^l^ks[i+3u];y=(y>>4u)|(y<<28u);
+      r^=sp[64u+(y&0x3fu)]|sp[192u+((y>>8u)&0x3fu)]|sp[320u+((y>>16u)&0x3fu)]|sp[448u+((y>>24u)&0x3fu)]|sp[x&0x3fu]|sp[128u+((x>>8u)&0x3fu)]|sp[256u+((x>>16u)&0x3fu)]|sp[384u+((x>>24u)&0x3fu)];
+    }
+    let swap=l;l=r;r=swap;
+  }
+  t=r;r=(l>>1u)|(l<<31u);l=(t>>1u)|(t<<31u);
+  t=((r>>1u)^l)&0x55555555u;r^=t<<1u;l^=t;
+  t=((l>>8u)^r)&0x00ff00ffu;l^=t<<8u;r^=t;
+  t=((r>>2u)^l)&0x33333333u;r^=t<<2u;l^=t;
+  t=((l>>16u)^r)&0x0000ffffu;l^=t<<16u;r^=t;
+  t=((r>>4u)^l)&0x0f0f0f0fu;r^=t<<4u;l^=t;
+  let hi=((l&255u)<<24u)|((l&0xff00u)<<8u)|((l&0xff0000u)>>8u)|((l&0xff000000u)>>24u);
+  let lo=((r&255u)<<24u)|((r&0xff00u)<<8u)|((r&0xff0000u)>>8u)|((r&0xff000000u)>>24u);
+  var result:array<u32,10>;
+  for(var g=1u;g<11u;g++){
+    let bit=g*6u;var val:u32;
+    if(bit+6u<=32u){val=(hi>>(26u-bit))&63u;}
+    else if(bit>=32u){let p=bit-32u;if(p+6u<=32u){val=(lo>>(26u-p))&63u;}else{val=(lo<<(p-26u))&63u;}}
+    else{let k=32u-bit;val=(((hi&((1u<<k)-1u))<<(6u-k))|(lo>>(32u-(6u-k))))&63u;}
+    result[g-1u]=cov[val];
+  }
+  return result;
+}
+
+fn lower(ch:u32)->u32{
+  if(ch>=65u&&ch<=90u){return ch+32u;}
+  return ch;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>){
+  let id=gid.x;if(id>=params.count){return;}
+  var key:array<u32,8>;
+  let base=array<u32,8>(params.b0,params.b1,params.b2,params.b3,params.b4,params.b5,params.b6,params.b7);
+  var carry=id;
+  for(var p=8u;p>0u;p--){
+    let i=p-1u;let sum=base[i]+carry;
+    let ix=sum%params.n;carry=sum/params.n;
+    key[i]=codes[ix];
+  }
+  let result=trip(key);
+  for(var ti=0u;ti<params.targetCount;ti++){
+    let targetBase=ti*11u;let len=targets[targetBase];
+    for(var pos=0u;pos<=10u-len;pos++){
+      if(params.mode==1u&&pos>0u){break;}
+      if(params.mode==2u&&pos<10u-len){continue;}
+      var matched=true;
+      for(var j=0u;j<len;j++){
+        var ch=result[pos+j];
+        if(params.icase!=0u){ch=lower(ch);}
+        if(ch!=targets[targetBase+1u+j]){matched=false;break;}
+      }
+      if(matched){atomicOr(&output[id>>5u],1u<<(id&31u));return;}
+    }
+  }
+}
+`;
+
+  function createGpuBuffer(device,data){
+    var buffer=device.createBuffer({size:data.byteLength,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
+    device.queue.writeBuffer(buffer,0,data);
+    return buffer;
+  }
+  async function createGpuSearch(job){
+    if(!navigator.gpu)return null;
+    var adapter=await navigator.gpu.requestAdapter({powerPreference:'high-performance'});
+    if(!adapter)return null;
+    var device=await adapter.requestDevice();
+    var sp=new Uint32Array(512),skb=new Uint32Array(512);
+    for(var i=0;i<8;i++)for(var j=0;j<64;j++){sp[i*64+j]=TABLES.SPtrans[i][j];skb[i*64+j]=TABLES.skb[i][j];}
+    var saltText='.............................................../0123456789ABCDEF'+'GABCDEFGHIJKLMNOPQRSTUVWXYZabcdefabcdefghijklmnopqrstuvwxyz.....';
+    var saltMap=new Uint32Array(128);
+    for(var i=0;i<saltMap.length;i++)saltMap[i]=saltText.charCodeAt(i)||46;
+    var conSalt=new Uint32Array(TABLES.con_salt.length+saltMap.length);
+    conSalt.set(TABLES.con_salt);
+    conSalt.set(saltMap,TABLES.con_salt.length);
+    var codes=new Uint32Array(Array.from(CHARSETS[$('charset').value],function(c){return c.charCodeAt(0);}));
+    var targetData=new Uint32Array(job.targets.length*11);
+    for(var i=0;i<job.targets.length;i++){
+      var target=job.targets[i],offset=i*11;
+      targetData[offset]=target.length;
+      for(var j=0;j<target.length;j++)targetData[offset+1+j]=target.charCodeAt(j);
+    }
+    var tables=[
+      createGpuBuffer(device,sp),
+      createGpuBuffer(device,skb),
+      createGpuBuffer(device,conSalt),
+      createGpuBuffer(device,new Uint32Array(TABLES.shifts2.map(function(x){return x?1:0;}))),
+      createGpuBuffer(device,new Uint32Array(TABLES.cov_2char)),
+      createGpuBuffer(device,codes),
+      createGpuBuffer(device,targetData)
+    ];
+    var shader=device.createShaderModule({code:gpuShader});
+    var compilation=await shader.getCompilationInfo();
+    var shaderErrors=compilation.messages.filter(function(m){return m.type==='error';});
+    if(shaderErrors.length)throw new Error(shaderErrors.map(function(m){return m.message;}).join(' '));
+    var pipeline=await device.createComputePipelineAsync({layout:'auto',compute:{module:shader,entryPoint:'main'}});
+    var maxWorkgroups=Math.min(65535,adapter.limits.maxComputeWorkgroupsPerDimension,
+      Math.floor(adapter.limits.maxStorageBufferBindingSize/(64*4)));
+    var maxBatchSize=maxWorkgroups*64, outputBytes=Math.ceil(maxBatchSize/32)*4;
+    $('gpuworkers').max=maxWorkgroups;
+    if(+$('gpuworkers').value>maxWorkgroups)$('gpuworkers').value=maxWorkgroups;
+    if(+$('gpuworkers').value<+$('gpuworkers').min)$('gpuworkers').value=+$('gpuworkers').min;
+    showGpuWorkers();
+    var params=device.createBuffer({size:64,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});
+    var output=device.createBuffer({size:outputBytes,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST});
+    var staging=device.createBuffer({size:outputBytes,usage:GPUBufferUsage.MAP_READ|GPUBufferUsage.COPY_DST});
+    var group=device.createBindGroup({layout:pipeline.getBindGroupLayout(0),entries:[
+      {binding:0,resource:{buffer:tables[0]}},{binding:1,resource:{buffer:tables[1]}},
+      {binding:2,resource:{buffer:tables[2]}},{binding:3,resource:{buffer:tables[3]}},
+      {binding:4,resource:{buffer:tables[4]}},{binding:5,resource:{buffer:tables[5]}},
+      {binding:6,resource:{buffer:tables[6]}},{binding:7,resource:{buffer:params}},
+      {binding:8,resource:{buffer:output}}
+    ]});
+    var info=adapter.info||{},adapterName=[info.vendor,info.architecture,info.device,info.description].filter(Boolean).join(' ');
+    return {device:device,tables:tables.concat([params,output,staging]),pipeline:pipeline,group:group,params:params,output:output,staging:staging,codes:codes,conLength:TABLES.con_salt.length,adapterName:adapterName,maxWorkgroups:maxWorkgroups,maxBatchSize:maxBatchSize};
+  }
+  function destroyGpu(gpu){gpu.tables.forEach(function(b){b.destroy();});}
+  function nextGpuBase(base,n,count){
+    var carry=count;
+    for(var p=7;p>=0;p--){var sum=base[p]+carry;base[p]=sum%n;carry=Math.floor(sum/n);}
+  }
+  async function runGpuSearch(gpu,job,onBatch){
+    var n=gpu.codes.length,base=new Uint32Array(8),seed=new Uint32Array(8);
+    crypto.getRandomValues(seed);
+    for(var i=0;i<8;i++)base[i]=seed[i]%n;
+    var uniform=new Uint32Array(16);uniform[1]=n;
+    uniform[10]=job.mode==='start'?1:job.mode==='end'?2:0;
+    uniform[11]=job.targets.length;uniform[12]=job.icase?1:0;uniform[13]=gpu.conLength;
+    var runningGpu=true;
+    running.gpuActive=true;
+    running.stopGpu=function(){runningGpu=false;};
+    try{
+      while(runningGpu&&timer){
+        var batchSize=Math.min(+$('gpuworkers').value,gpu.maxWorkgroups)*64;
+        uniform[0]=batchSize;
+        for(var i=0;i<8;i++)uniform[i+2]=base[i];
+        gpu.device.queue.writeBuffer(gpu.params,0,uniform);
+        var encoder=gpu.device.createCommandEncoder();
+        var outputBytes=Math.ceil(batchSize/32)*4;
+        encoder.clearBuffer(gpu.output,0,outputBytes);
+        var pass=encoder.beginComputePass();pass.setPipeline(gpu.pipeline);pass.setBindGroup(0,gpu.group);
+        pass.dispatchWorkgroups(batchSize/64);pass.end();
+        encoder.copyBufferToBuffer(gpu.output,0,gpu.staging,0,outputBytes);
+        gpu.device.queue.submit([encoder.finish()]);
+        await gpu.staging.mapAsync(GPUMapMode.READ);
+        var flags=new Uint32Array(gpu.staging.getMappedRange()),hits=[];
+        for(var word=0;word<flags.length;word++){
+          var bits=flags[word];
+          while(bits){
+            var bit=31-Math.clz32(bits&-bits),id=word*32+bit;
+            bits&=bits-1;
+            if(id>=batchSize)continue;
+          var key=new Uint8Array(8),pw='',carry=id;
+          for(var p=7;p>=0;p--){var sum=base[p]+carry,ix=sum%n;carry=Math.floor(sum/n);key[p]=gpu.codes[ix];pw=String.fromCharCode(key[p])+pw;}
+            var t=trip(key,8),s=job.icase?t.toLowerCase():t;
+            for(var j=0;j<job.targets.length;j++){
+              var target=job.targets[j],ok;
+              if(job.mode==='start')ok=s.lastIndexOf(target,0)===0;
+              else if(job.mode==='end')ok=s.indexOf(target,10-target.length)!==-1;
+              else ok=s.indexOf(target)!==-1;
+              if(ok){hits.push([pw,t,j]);break;}
+            }
+            if(job.stopFirst)break;
+          }
+          if(job.stopFirst&&hits.length)break;
+        }
+        gpu.staging.unmap();
+        nextGpuBase(base,n,batchSize);
+        onBatch({tried:batchSize,hits:hits});
+        if(!runningGpu||!timer)break;
+      }
+    }finally{destroyGpu(gpu);}
   }
 
   var maxWorkers=navigator.hardwareConcurrency||4;
@@ -355,8 +668,18 @@ function runSearch(m,post){
   $('workers').value=Math.max(1,maxWorkers-1);
   $('workersmax').textContent=maxWorkers;
   function showWorkers(){$('workersval').textContent=$('workers').value;}
+  function showGpuWorkers(){$('gpuworkersval').textContent=$('gpuworkers').value;}
   showWorkers();
+  showGpuWorkers();
   $('workers').addEventListener('input',function(){showWorkers();setWorkerCount(+this.value);});
+  $('gpuworkers').addEventListener('input',function(){
+    showGpuWorkers();
+    if(running&&running.gpuActive){
+      $('computeStatus').textContent=running.mode==='both'
+        ?'Searching with GPU ('+this.value+' workgroups) + '+workers.length+' CPU workers.'
+        :'Searching with WebGPU acceleration ('+this.value+' workgroups per dispatch).';
+    }
+  });
   $('target').addEventListener('keydown',function(e){if(e.key==='Enter'&&!$('go').disabled)$('go').click();});
 })();
 </script>
