@@ -11,7 +11,7 @@ Use it here: https://m4c4r0n1n.github.io/Tripcode-Generator/
 Or just download index.html and open it.
 
 ### Update
-Added CUDA support for 30-50 series Nvidia GPUs, if you do not have one you can use the .io site here, make sure webgpu is enabled in about:config. Please use responsibly. I will not be held responsible for your actions. 
+Added CUDA support for 30-50 series Nvidia GPUs, if you do not have one you can use the .io site here, make sure webgpu is enabled in about:config. Adding bitslicing after I work it out. Please use responsibly. I will not be held responsible for your actions. 
 
 <a href="https://ko-fi.com/koifist"><img alt="Ko-fi" src="https://img.shields.io/badge/Ko--fi-support-eb6f92?logo=kofi&logoColor=e0def4&style=for-the-badge&labelColor=232136" /></a>
 
