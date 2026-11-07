@@ -64,12 +64,6 @@ td.pw:hover{text-decoration:underline}
   <select id="computeMode"><option value="gpu">GPU only</option><option value="cpu">CPU only</option><option value="both">GPU + CPU</option></select>
 </div>
 <div class="slider">
-  <label for="gpuworkers">GPU workgroups</label>
-  <input id="gpuworkers" type="range" min="256" max="65535" step="256" value="16384">
-  <b id="gpuworkersval">16384</b>
-  <span>per batch × 64 GPU lanes; tune for your device</span>
-</div>
-<div class="slider">
   <label for="workers">CPU workers</label>
   <input id="workers" type="range" min="1" max="4" value="3">
   <b id="workersval">3</b>
@@ -297,7 +291,6 @@ function runSearch(m,post){
   }
   function updateComputeControls(){
     var mode=$('computeMode').value;
-    $('gpuworkers').disabled=mode==='cpu';
     $('workers').disabled=(mode==='gpu'&&!(running&&running.cpuEnabled))||!!(workers.inline&&timer);
     $('computeMode').disabled=!!timer;
   }
@@ -367,7 +360,7 @@ function runSearch(m,post){
         var gpuName=gpu.adapterName?' ('+gpu.adapterName+')':'';
         $('computeStatus').textContent=computeMode==='both'
           ?'Searching with high-performance GPU'+gpuName+' and '+workers.length+' CPU workers.'
-          :'Searching with high-performance GPU'+gpuName+' ('+$('gpuworkers').value+' workgroups per dispatch).';
+          :'Searching with high-performance GPU'+gpuName+'.';
         updateThreadCount();
         runGpuSearch(gpu,job,onBatch).catch(function(err){
           if(!timer)return;
@@ -447,7 +440,7 @@ function runSearch(m,post){
   }
 
   var gpuShader=`
-struct Params { count:u32, n:u32, b0:u32, b1:u32, b2:u32, b3:u32, b4:u32, b5:u32, b6:u32, b7:u32, mode:u32, targetCount:u32, icase:u32, conLength:u32, pad:u32 };
+struct Params { count:u32, n:u32, b0:u32, b1:u32, b2:u32, b3:u32, b4:u32, b5:u32, b6:u32, b7:u32, mode:u32, targetCount:u32, icase:u32, conLength:u32, width:u32, cap:u32 };
 @group(0) @binding(0) var<storage,read> sp:array<u32>;
 @group(0) @binding(1) var<storage,read> skb:array<u32>;
 @group(0) @binding(2) var<storage,read> conSalt:array<u32>;
@@ -519,7 +512,7 @@ fn lower(ch:u32)->u32{
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid:vec3<u32>){
-  let id=gid.x;if(id>=params.count){return;}
+  let id=gid.x+gid.y*params.width;if(id>=params.count){return;}
   var key:array<u32,8>;
   let base=array<u32,8>(params.b0,params.b1,params.b2,params.b3,params.b4,params.b5,params.b6,params.b7);
   var carry=id;
@@ -540,7 +533,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
         if(params.icase!=0u){ch=lower(ch);}
         if(ch!=targets[targetBase+1u+j]){matched=false;break;}
       }
-      if(matched){atomicOr(&output[id>>5u],1u<<(id&31u));return;}
+      if(matched){let slot=atomicAdd(&output[0],1u);if(slot<params.cap){atomicStore(&output[slot+1u],id);}return;}
     }
   }
 }
@@ -585,26 +578,25 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     var shaderErrors=compilation.messages.filter(function(m){return m.type==='error';});
     if(shaderErrors.length)throw new Error(shaderErrors.map(function(m){return m.message;}).join(' '));
     var pipeline=await device.createComputePipelineAsync({layout:'auto',compute:{module:shader,entryPoint:'main'}});
-    var maxWorkgroups=Math.min(65535,adapter.limits.maxComputeWorkgroupsPerDimension,
-      Math.floor(adapter.limits.maxStorageBufferBindingSize/(64*4)));
-    var maxBatchSize=maxWorkgroups*64, outputBytes=Math.ceil(maxBatchSize/32)*4;
-    $('gpuworkers').max=maxWorkgroups;
-    if(+$('gpuworkers').value>maxWorkgroups)$('gpuworkers').value=maxWorkgroups;
-    if(+$('gpuworkers').value<+$('gpuworkers').min)$('gpuworkers').value=+$('gpuworkers').min;
-    showGpuWorkers();
-    var params=device.createBuffer({size:64,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});
-    var output=device.createBuffer({size:outputBytes,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST});
-    var staging=device.createBuffer({size:outputBytes,usage:GPUBufferUsage.MAP_READ|GPUBufferUsage.COPY_DST});
-    var group=device.createBindGroup({layout:pipeline.getBindGroupLayout(0),entries:[
-      {binding:0,resource:{buffer:tables[0]}},{binding:1,resource:{buffer:tables[1]}},
-      {binding:2,resource:{buffer:tables[2]}},{binding:3,resource:{buffer:tables[3]}},
-      {binding:4,resource:{buffer:tables[4]}},{binding:5,resource:{buffer:tables[5]}},
-      {binding:6,resource:{buffer:tables[6]}},{binding:7,resource:{buffer:params}},
-      {binding:8,resource:{buffer:output}}
-    ]});
+    var maxWorkgroups=device.limits.maxComputeWorkgroupsPerDimension;
+    var slots=[];
+    for(var i=0;i<GPU_SLOTS;i++){
+      var params=device.createBuffer({size:64,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});
+      var output=device.createBuffer({size:GPU_OUTPUT_BYTES,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST});
+      var staging=device.createBuffer({size:GPU_OUTPUT_BYTES,usage:GPUBufferUsage.MAP_READ|GPUBufferUsage.COPY_DST});
+      tables.push(params,output,staging);
+      slots.push({params:params,output:output,staging:staging,group:device.createBindGroup({layout:pipeline.getBindGroupLayout(0),entries:[
+        {binding:0,resource:{buffer:tables[0]}},{binding:1,resource:{buffer:tables[1]}},
+        {binding:2,resource:{buffer:tables[2]}},{binding:3,resource:{buffer:tables[3]}},
+        {binding:4,resource:{buffer:tables[4]}},{binding:5,resource:{buffer:tables[5]}},
+        {binding:6,resource:{buffer:tables[6]}},{binding:7,resource:{buffer:params}},
+        {binding:8,resource:{buffer:output}}
+      ]})});
+    }
     var info=adapter.info||{},adapterName=[info.vendor,info.architecture,info.device,info.description].filter(Boolean).join(' ');
-    return {device:device,tables:tables.concat([params,output,staging]),pipeline:pipeline,group:group,params:params,output:output,staging:staging,codes:codes,conLength:TABLES.con_salt.length,adapterName:adapterName,maxWorkgroups:maxWorkgroups,maxBatchSize:maxBatchSize};
+    return {device:device,tables:tables,pipeline:pipeline,slots:slots,codes:codes,conLength:TABLES.con_salt.length,adapterName:adapterName,maxWorkgroups:maxWorkgroups};
   }
+  var GPU_SLOTS=3,GPU_HIT_CAP=4096,GPU_OUTPUT_BYTES=(GPU_HIT_CAP+1)*4,GPU_BATCH_MS=120,GPU_MIN_BATCH=1048576,GPU_MAX_BATCH=1073741824;
   function destroyGpu(gpu){gpu.tables.forEach(function(b){b.destroy();});}
   function nextGpuBase(base,n,count){
     var carry=count;
@@ -614,53 +606,66 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     var n=gpu.codes.length,base=new Uint32Array(8),seed=new Uint32Array(8);
     crypto.getRandomValues(seed);
     for(var i=0;i<8;i++)base[i]=seed[i]%n;
-    var uniform=new Uint32Array(16);uniform[1]=n;
-    uniform[10]=job.mode==='start'?1:job.mode==='end'?2:0;
-    uniform[11]=job.targets.length;uniform[12]=job.icase?1:0;uniform[13]=gpu.conLength;
-    var runningGpu=true;
+    var runningGpu=true,batchSize=GPU_MIN_BATCH,started=performance.now(),done=0,width=gpu.maxWorkgroups*64,queue=[];
     running.gpuActive=true;
     running.stopGpu=function(){runningGpu=false;};
-    try{
-      while(runningGpu&&timer){
-        var batchSize=Math.min(+$('gpuworkers').value,gpu.maxWorkgroups)*64;
-        uniform[0]=batchSize;
-        for(var i=0;i<8;i++)uniform[i+2]=base[i];
-        gpu.device.queue.writeBuffer(gpu.params,0,uniform);
-        var encoder=gpu.device.createCommandEncoder();
-        var outputBytes=Math.ceil(batchSize/32)*4;
-        encoder.clearBuffer(gpu.output,0,outputBytes);
-        var pass=encoder.beginComputePass();pass.setPipeline(gpu.pipeline);pass.setBindGroup(0,gpu.group);
-        pass.dispatchWorkgroups(batchSize/64);pass.end();
-        encoder.copyBufferToBuffer(gpu.output,0,gpu.staging,0,outputBytes);
-        gpu.device.queue.submit([encoder.finish()]);
-        await gpu.staging.mapAsync(GPUMapMode.READ);
-        var flags=new Uint32Array(gpu.staging.getMappedRange()),hits=[];
-        for(var word=0;word<flags.length;word++){
-          var bits=flags[word];
-          while(bits){
-            var bit=31-Math.clz32(bits&-bits),id=word*32+bit;
-            bits&=bits-1;
-            if(id>=batchSize)continue;
-          var key=new Uint8Array(8),pw='',carry=id;
-          for(var p=7;p>=0;p--){var sum=base[p]+carry,ix=sum%n;carry=Math.floor(sum/n);key[p]=gpu.codes[ix];pw=String.fromCharCode(key[p])+pw;}
-            var t=trip(key,8),s=job.icase?t.toLowerCase():t;
-            for(var j=0;j<job.targets.length;j++){
-              var target=job.targets[j],ok;
-              if(job.mode==='start')ok=s.lastIndexOf(target,0)===0;
-              else if(job.mode==='end')ok=s.indexOf(target,10-target.length)!==-1;
-              else ok=s.indexOf(target)!==-1;
-              if(ok){hits.push([pw,t,j]);break;}
-            }
-            if(job.stopFirst)break;
-          }
-          if(job.stopFirst&&hits.length)break;
+    function submit(slot){
+      var uniform=new Uint32Array(16);
+      uniform[0]=batchSize;uniform[1]=n;
+      for(var i=0;i<8;i++)uniform[i+2]=base[i];
+      uniform[10]=job.mode==='start'?1:job.mode==='end'?2:0;
+      uniform[11]=job.targets.length;uniform[12]=job.icase?1:0;uniform[13]=gpu.conLength;
+      uniform[14]=width;uniform[15]=GPU_HIT_CAP;
+      gpu.device.queue.writeBuffer(slot.params,0,uniform);
+      var encoder=gpu.device.createCommandEncoder();
+      encoder.clearBuffer(slot.output,0,GPU_OUTPUT_BYTES);
+      var pass=encoder.beginComputePass();pass.setPipeline(gpu.pipeline);pass.setBindGroup(0,slot.group);
+      var groups=Math.ceil(batchSize/64);
+      pass.dispatchWorkgroups(Math.min(groups,gpu.maxWorkgroups),Math.ceil(groups/gpu.maxWorkgroups));pass.end();
+      encoder.copyBufferToBuffer(slot.output,0,slot.staging,0,GPU_OUTPUT_BYTES);
+      gpu.device.queue.submit([encoder.finish()]);
+      slot.base=base.slice();slot.size=batchSize;
+      slot.mapped=slot.staging.mapAsync(GPUMapMode.READ);
+      slot.mapped.catch(function(){});
+      nextGpuBase(base,n,batchSize);
+      queue.push(slot);
+    }
+    function collect(slot){
+      var flags=new Uint32Array(slot.staging.getMappedRange()),hits=[],total=Math.min(flags[0],GPU_HIT_CAP);
+      for(var h=0;h<total;h++){
+        var id=flags[h+1],key=new Uint8Array(8),pw='',carry=id;
+        for(var p=7;p>=0;p--){var sum=slot.base[p]+carry,ix=sum%n;carry=Math.floor(sum/n);key[p]=gpu.codes[ix];pw=String.fromCharCode(key[p])+pw;}
+        var t=trip(key,8),s=job.icase?t.toLowerCase():t;
+        for(var j=0;j<job.targets.length;j++){
+          var target=job.targets[j],ok;
+          if(job.mode==='start')ok=s.lastIndexOf(target,0)===0;
+          else if(job.mode==='end')ok=s.indexOf(target,10-target.length)!==-1;
+          else ok=s.indexOf(target)!==-1;
+          if(ok){hits.push([pw,t,j]);break;}
         }
-        gpu.staging.unmap();
-        nextGpuBase(base,n,batchSize);
-        onBatch({tried:batchSize,hits:hits});
-        if(!runningGpu||!timer)break;
+        if(job.stopFirst&&hits.length)break;
       }
-    }finally{destroyGpu(gpu);}
+      slot.staging.unmap();
+      return hits;
+    }
+    try{
+      gpu.slots.forEach(submit);
+      while(runningGpu&&timer){
+        var slot=queue.shift();
+        await slot.mapped;
+        if(!runningGpu||!timer){slot.staging.unmap();break;}
+        var hits=collect(slot);
+        done+=slot.size;
+        onBatch({tried:slot.size,hits:hits});
+        if(!runningGpu||!timer)break;
+        var rate=done/((performance.now()-started)/1000);
+        batchSize=Math.max(GPU_MIN_BATCH,Math.min(GPU_MAX_BATCH,Math.round(rate*GPU_BATCH_MS/1000/64)*64));
+        submit(slot);
+      }
+    }finally{
+      await gpu.device.queue.onSubmittedWorkDone();
+      destroyGpu(gpu);
+    }
   }
 
   var maxWorkers=navigator.hardwareConcurrency||4;
@@ -668,18 +673,8 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   $('workers').value=Math.max(1,maxWorkers-1);
   $('workersmax').textContent=maxWorkers;
   function showWorkers(){$('workersval').textContent=$('workers').value;}
-  function showGpuWorkers(){$('gpuworkersval').textContent=$('gpuworkers').value;}
   showWorkers();
-  showGpuWorkers();
   $('workers').addEventListener('input',function(){showWorkers();setWorkerCount(+this.value);});
-  $('gpuworkers').addEventListener('input',function(){
-    showGpuWorkers();
-    if(running&&running.gpuActive){
-      $('computeStatus').textContent=running.mode==='both'
-        ?'Searching with GPU ('+this.value+' workgroups) + '+workers.length+' CPU workers.'
-        :'Searching with WebGPU acceleration ('+this.value+' workgroups per dispatch).';
-    }
-  });
   $('target').addEventListener('keydown',function(e){if(e.key==='Enter'&&!$('go').disabled)$('go').click();});
 })();
 </script>
