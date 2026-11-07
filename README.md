@@ -15,4 +15,8 @@ Added CUDA support for 30-50 series Nvidia GPUs, if you do not have one you can 
 
 <a href="https://ko-fi.com/koifist"><img alt="Ko-fi" src="https://img.shields.io/badge/Ko--fi-support-eb6f92?logo=kofi&logoColor=e0def4&style=for-the-badge&labelColor=232136" /></a>
 
+Before
 <img width="849" height="888" alt="image" src="https://github.com/user-attachments/assets/4387ce97-7549-4b18-94dc-bee7257b10cd" />
+
+After
+<img width="815" height="836" alt="image" src="https://github.com/user-attachments/assets/2b9f27a8-8ca1-4bdb-ab47-f65712f30087" />
