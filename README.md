@@ -11,7 +11,7 @@ Use it here: https://m4c4r0n1n.github.io/Tripcode-Generator/
 Or just download index.html and open it.
 
 ### Update
-Added CUDA support for 30-50 series Nvidia GPUs, if you do not have one you can use the .io site here, make sure webgpu is enabled in about:config. Removed the GPU workgroups slider. The search now sets the batch size automatically, so each batch takes about 120 ms on your GPU. The slider only made batches bigger, which was the only way to get past the browser limit of 10 batches per second. The search now keeps 3 batches queued, so the GPU does not wait between batches. Speed went from 10M to 41M maximum tries per second with the slider setting raised to about 530M on an RTX 4090 in Zen. Please use responsibly.
+Added CUDA support for 30-50 series Nvidia GPUs, if you do not have one you can use the .io site here, make sure webgpu is enabled in about:config. Removed the GPU workgroups slider. The search now sets the batch size automatically, so each batch takes about 120 ms on your GPU. The slider only made batches bigger, which was the only way to get past the browser limit of 10 batches per second. The search now keeps 3 batches queued, so the GPU does not wait between batches. Speed went from 10M-41M maximum tries per second with the slider setting raised to about 530M on an RTX 4090 in Zen. Please use responsibly.
 
 <a href="https://ko-fi.com/koifist"><img alt="Ko-fi" src="https://img.shields.io/badge/Ko--fi-support-eb6f92?logo=kofi&logoColor=e0def4&style=for-the-badge&labelColor=232136" /></a>
 
